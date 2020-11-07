@@ -5,10 +5,9 @@ on: [push]
 jobs:
   build-nix:
     runs-on: ${{ matrix.os }}
-    if: github.ref == 'refs/heads/master'
     strategy:
       matrix:
-        type: [ubuntu-x64, ubuntu-x86]
+        type: [ubuntu-x64]
         include:
           - type: ubuntu-x64
             os: ubuntu-latest
@@ -16,12 +15,6 @@ jobs:
             name: x86_64-linux-feroxbuster
             path: target/x86_64-unknown-linux-musl/release/feroxbuster
             pkg_config_path: /usr/lib/x86_64-linux-gnu/pkgconfig
-          - type: ubuntu-x86
-            os: ubuntu-latest
-            target: i686-unknown-linux-musl
-            name: x86-linux-feroxbuster
-            path: target/i686-unknown-linux-musl/release/feroxbuster
-            pkg_config_path: /usr/lib/i686-linux-gnu/pkgconfig
     steps:
       - uses: actions/checkout@v2
       - name: Install System Dependencies
@@ -70,68 +63,4 @@ jobs:
         with:
           name: feroxbuster_amd64.deb
           path: ./target/x86_64-unknown-linux-musl/debian/*
-
-  build-macos:
-    runs-on: macos-latest
-    if: github.ref == 'refs/heads/master'
-    steps:
-      - uses: actions/checkout@v2
-      - uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          target: x86_64-apple-darwin
-          override: true
-      - uses: actions-rs/cargo@v1
-        with:
-          use-cross: true
-          command: build
-          args: --release --target=x86_64-apple-darwin
-      - name: Strip symbols from binary
-        run: |
-          strip -u -r target/x86_64-apple-darwin/release/feroxbuster
-      - name: Build tar.gz for homebrew installs
-        run: |
-          tar czf x86_64-macos-feroxbuster.tar.gz -C target/x86_64-apple-darwin/release feroxbuster
-      - uses: actions/upload-artifact@v2
-        with:
-          name: x86_64-macos-feroxbuster
-          path: target/x86_64-apple-darwin/release/feroxbuster
-      - uses: actions/upload-artifact@v2
-        with:
-          name: x86_64-macos-feroxbuster.tar.gz
-          path: x86_64-macos-feroxbuster.tar.gz
-
-  build-windows:
-    runs-on: ${{ matrix.os }}
-    if: github.ref == 'refs/heads/master'
-    strategy:
-      matrix:
-        type: [windows-x64, windows-x86]
-        include:
-          - type: windows-x64
-            os: windows-latest
-            target: x86_64-pc-windows-msvc
-            name: x86_64-windows-feroxbuster.exe
-            path: target\x86_64-pc-windows-msvc\release\feroxbuster.exe
-          - type: windows-x86
-            os: windows-latest
-            target: i686-pc-windows-msvc
-            name: x86-windows-feroxbuster.exe
-            path: target\i686-pc-windows-msvc\release\feroxbuster.exe
-    steps:
-      - uses: actions/checkout@v2
-      - uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          target: ${{ matrix.target }}
-          override: true
-      - uses: actions-rs/cargo@v1
-        with:
-          use-cross: true
-          command: build
-          args: --release --target=${{ matrix.target }}
-      - uses: actions/upload-artifact@v2
-        with:
-          name: ${{ matrix.name }}
-          path: ${{ matrix.path }}
 

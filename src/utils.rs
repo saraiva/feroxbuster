@@ -1,5 +1,10 @@
+#![macro_use]
 use crate::{
     config::{CONFIGURATION, PROGRESS_PRINTER},
+    statistics::{
+        StatCommand::{self, AddError, AddStatus},
+        StatError::{Connection, Other, Redirection, Request, Timeout, UrlFormat},
+    },
     FeroxError, FeroxResult,
 };
 use console::{strip_ansi_codes, style, user_attended};
@@ -10,6 +15,7 @@ use rlimit::{getrlimit, setrlimit, Resource, Rlim};
 use std::convert::TryInto;
 use std::sync::{Arc, RwLock};
 use std::{fs, io};
+use tokio::sync::mpsc::UnboundedSender;
 
 /// Given the path to a file, open the file in append mode (create it if it doesn't exist) and
 /// return a reference to the file that is buffered and locked
@@ -160,6 +166,14 @@ pub fn ferox_print(msg: &str, bar: &ProgressBar) {
     }
 }
 
+#[macro_export]
+/// wrapper to improve code readability
+macro_rules! update_stat {
+    ($tx:expr, $value:expr) => {
+        $tx.send($value).unwrap_or_default();
+    };
+}
+
 /// Simple helper to generate a `Url`
 ///
 /// Errors during parsing `url` or joining `word` are propagated up the call stack
@@ -169,14 +183,16 @@ pub fn format_url(
     add_slash: bool,
     queries: &[(String, String)],
     extension: Option<&str>,
+    tx_stats: UnboundedSender<StatCommand>,
 ) -> FeroxResult<Url> {
     log::trace!(
-        "enter: format_url({}, {}, {}, {:?} {:?})",
+        "enter: format_url({}, {}, {}, {:?} {:?}, {:?})",
         url,
         word,
         add_slash,
         queries,
-        extension
+        extension,
+        tx_stats
     );
 
     if Url::parse(&word).is_ok() {
@@ -193,8 +209,9 @@ pub fn format_url(
         );
         log::warn!("{}", message);
 
-        let mut err = FeroxError::default();
-        err.message = message;
+        let err = FeroxError { message };
+
+        update_stat!(tx_stats, AddError(UrlFormat));
 
         log::trace!("exit: format_url -> {}", err);
         return Err(Box::new(err));
@@ -208,7 +225,7 @@ pub fn format_url(
     // the transforms that occur here will need to keep this in mind, i.e. add a slash to preserve
     // the current directory sent as part of the url
     let url = if word.is_empty() {
-        // v1.0.6: added during --extract-links feature inplementation to support creating urls
+        // v1.0.6: added during --extract-links feature implementation to support creating urls
         // that were extracted from response bodies, i.e. http://localhost/some/path/js/main.js
         url.to_string()
     } else if !url.ends_with('/') {
@@ -225,6 +242,15 @@ pub fn format_url(
     } else if add_slash && !word.ends_with('/') {
         // -f used, and word doesn't already end with a /
         format!("{}/", word)
+    } else if word.starts_with("//") {
+        // bug ID'd by @Sicks3c, when a wordlist contains words that begin with 2 forward slashes
+        // i.e. //1_40_0/static/js, it gets joined onto the base url in a surprising way
+        // ex: https://localhost/ + //1_40_0/static/js -> https://1_40_0/static/js
+        // this is due to the fact that //... is a valid url. The fix is introduced here in 1.12.2
+        // and simply removes prefixed forward slashes if there are two of them. Additionally,
+        // trim_start_matches will trim the pattern until it's gone, so even if there are more than
+        // 2 /'s, they'll still be trimmed
+        word.trim_start_matches('/').to_string()
     } else {
         String::from(word)
     };
@@ -255,6 +281,7 @@ pub fn format_url(
             }
         }
         Err(e) => {
+            update_stat!(tx_stats, AddError(UrlFormat));
             log::trace!("exit: format_url -> {}", e);
             log::error!("Could not join {} with {}", word, base_url);
             Err(Box::new(e))
@@ -263,36 +290,62 @@ pub fn format_url(
 }
 
 /// Initiate request to the given `Url` using `Client`
-pub async fn make_request(client: &Client, url: &Url) -> FeroxResult<Response> {
-    log::trace!("enter: make_request(CONFIGURATION.Client, {})", url);
+pub async fn make_request(
+    client: &Client,
+    url: &Url,
+    tx_stats: UnboundedSender<StatCommand>,
+) -> FeroxResult<Response> {
+    log::trace!(
+        "enter: make_request(CONFIGURATION.Client, {}, {:?})",
+        url,
+        tx_stats
+    );
 
     match client.get(url.to_owned()).send().await {
-        Ok(resp) => {
-            log::trace!("exit: make_request -> {:?}", resp);
-            Ok(resp)
-        }
         Err(e) => {
+            let mut log_level = log::Level::Error;
+
             log::trace!("exit: make_request -> {}", e);
-            if e.to_string().contains("operation timed out") {
+            if e.is_timeout() {
                 // only warn for timeouts, while actual errors are still left as errors
-                log::warn!("Error while making request: {}", e);
+                log_level = log::Level::Warn;
+                update_stat!(tx_stats, AddError(Timeout));
             } else if e.is_redirect() {
                 if let Some(last_redirect) = e.url() {
                     // get where we were headed (last_redirect) and where we came from (url)
                     let fancy_message = format!("{} !=> {}", url, last_redirect);
 
                     let report = if let Some(msg_status) = e.status() {
+                        update_stat!(tx_stats, AddStatus(msg_status));
                         create_report_string(msg_status.as_str(), "-1", "-1", "-1", &fancy_message)
                     } else {
                         create_report_string("UNK", "-1", "-1", "-1", &fancy_message)
                     };
 
+                    update_stat!(tx_stats, AddError(Redirection));
+
                     ferox_print(&report, &PROGRESS_PRINTER)
                 };
+            } else if e.is_connect() {
+                update_stat!(tx_stats, AddError(Connection));
+            } else if e.is_request() {
+                update_stat!(tx_stats, AddError(Request));
             } else {
-                log::error!("Error while making request: {}", e);
+                update_stat!(tx_stats, AddError(Other));
             }
+
+            if matches!(log_level, log::Level::Error) {
+                log::error!("Error while making request: {}", e);
+            } else {
+                log::warn!("Error while making request: {}", e);
+            }
+
             Err(Box::new(e))
+        }
+        Ok(resp) => {
+            log::trace!("exit: make_request -> {:?}", resp);
+            update_stat!(tx_stats, AddStatus(resp.status()));
+            Ok(resp)
         }
     }
 }
@@ -391,6 +444,8 @@ pub fn normalize_url(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::FeroxChannel;
+    use tokio::sync::mpsc;
 
     #[test]
     /// set_open_file_limit with a low requested limit succeeds
@@ -458,8 +513,9 @@ mod tests {
     #[test]
     /// base url + 1 word + no slash + no extension
     fn format_url_normal() {
+        let (tx, _): FeroxChannel<StatCommand> = mpsc::unbounded_channel();
         assert_eq!(
-            format_url("http://localhost", "stuff", false, &Vec::new(), None).unwrap(),
+            format_url("http://localhost", "stuff", false, &Vec::new(), None, tx).unwrap(),
             reqwest::Url::parse("http://localhost/stuff").unwrap()
         );
     }
@@ -467,8 +523,9 @@ mod tests {
     #[test]
     /// base url + no word + no slash + no extension
     fn format_url_no_word() {
+        let (tx, _): FeroxChannel<StatCommand> = mpsc::unbounded_channel();
         assert_eq!(
-            format_url("http://localhost", "", false, &Vec::new(), None).unwrap(),
+            format_url("http://localhost", "", false, &Vec::new(), None, tx).unwrap(),
             reqwest::Url::parse("http://localhost").unwrap()
         );
     }
@@ -476,13 +533,15 @@ mod tests {
     #[test]
     /// base url + word + no slash + no extension + queries
     fn format_url_joins_queries() {
+        let (tx, _): FeroxChannel<StatCommand> = mpsc::unbounded_channel();
         assert_eq!(
             format_url(
                 "http://localhost",
                 "lazer",
                 false,
                 &[(String::from("stuff"), String::from("things"))],
-                None
+                None,
+                tx
             )
             .unwrap(),
             reqwest::Url::parse("http://localhost/lazer?stuff=things").unwrap()
@@ -492,13 +551,15 @@ mod tests {
     #[test]
     /// base url + no word + no slash + no extension + queries
     fn format_url_without_word_joins_queries() {
+        let (tx, _): FeroxChannel<StatCommand> = mpsc::unbounded_channel();
         assert_eq!(
             format_url(
                 "http://localhost",
                 "",
                 false,
                 &[(String::from("stuff"), String::from("things"))],
-                None
+                None,
+                tx
             )
             .unwrap(),
             reqwest::Url::parse("http://localhost/?stuff=things").unwrap()
@@ -509,14 +570,16 @@ mod tests {
     #[should_panic]
     /// no base url is an error
     fn format_url_no_url() {
-        format_url("", "stuff", false, &Vec::new(), None).unwrap();
+        let (tx, _): FeroxChannel<StatCommand> = mpsc::unbounded_channel();
+        format_url("", "stuff", false, &Vec::new(), None, tx).unwrap();
     }
 
     #[test]
     /// word prepended with slash is adjusted for correctness
     fn format_url_word_with_preslash() {
+        let (tx, _): FeroxChannel<StatCommand> = mpsc::unbounded_channel();
         assert_eq!(
-            format_url("http://localhost", "/stuff", false, &Vec::new(), None).unwrap(),
+            format_url("http://localhost", "/stuff", false, &Vec::new(), None, tx).unwrap(),
             reqwest::Url::parse("http://localhost/stuff").unwrap()
         );
     }
@@ -524,21 +587,45 @@ mod tests {
     #[test]
     /// word with appended slash allows the slash to persist
     fn format_url_word_with_postslash() {
+        let (tx, _): FeroxChannel<StatCommand> = mpsc::unbounded_channel();
         assert_eq!(
-            format_url("http://localhost", "stuff/", false, &Vec::new(), None).unwrap(),
+            format_url("http://localhost", "stuff/", false, &Vec::new(), None, tx).unwrap(),
             reqwest::Url::parse("http://localhost/stuff/").unwrap()
+        );
+    }
+
+    #[test]
+    /// word with two prepended slashes doesn't discard the entire domain
+    fn format_url_word_with_two_prepended_slashes() {
+        let (tx, _): FeroxChannel<StatCommand> = mpsc::unbounded_channel();
+
+        let result = format_url(
+            "http://localhost",
+            "//upload/img",
+            false,
+            &Vec::new(),
+            None,
+            tx,
+        )
+        .unwrap();
+
+        assert_eq!(
+            result,
+            reqwest::Url::parse("http://localhost/upload/img").unwrap()
         );
     }
 
     #[test]
     /// word that is a fully formed url, should return an error
     fn format_url_word_that_is_a_url() {
+        let (tx, _): FeroxChannel<StatCommand> = mpsc::unbounded_channel();
         let url = format_url(
             "http://localhost",
             "http://schmocalhost",
             false,
             &Vec::new(),
             None,
+            tx,
         );
         assert!(url.is_err());
     }

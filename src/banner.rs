@@ -1,9 +1,13 @@
-use crate::config::{Configuration, CONFIGURATION};
-use crate::utils::{make_request, status_colorizer};
+use crate::{
+    config::{Configuration, CONFIGURATION},
+    statistics::StatCommand,
+    utils::{make_request, status_colorizer},
+};
 use console::{style, Emoji};
 use reqwest::{Client, Url};
 use serde_json::Value;
 use std::io::Write;
+use tokio::sync::mpsc::UnboundedSender;
 
 /// macro helper to abstract away repetitive string formatting
 macro_rules! format_banner_entry_helper {
@@ -67,8 +71,13 @@ enum UpdateStatus {
 /// ex: v1.1.0
 ///
 /// Returns `UpdateStatus`
-async fn needs_update(client: &Client, url: &str, bin_version: &str) -> UpdateStatus {
-    log::trace!("enter: needs_update({:?}, {})", client, url);
+async fn needs_update(
+    client: &Client,
+    url: &str,
+    bin_version: &str,
+    tx_stats: UnboundedSender<StatCommand>,
+) -> UpdateStatus {
+    log::trace!("enter: needs_update({:?}, {}, {:?})", client, url, tx_stats);
 
     let unknown = UpdateStatus::Unknown;
 
@@ -81,7 +90,7 @@ async fn needs_update(client: &Client, url: &str, bin_version: &str) -> UpdateSt
         }
     };
 
-    if let Ok(response) = make_request(&client, &api_url).await {
+    if let Ok(response) = make_request(&client, &api_url, tx_stats.clone()).await {
         let body = response.text().await.unwrap_or_default();
 
         let json_response: Value = serde_json::from_str(&body).unwrap_or_default();
@@ -137,8 +146,13 @@ fn format_emoji(emoji: &str) -> String {
 /// Prints the banner to stdout.
 ///
 /// Only prints those settings which are either always present, or passed in by the user.
-pub async fn initialize<W>(targets: &[String], config: &Configuration, version: &str, mut writer: W)
-where
+pub async fn initialize<W>(
+    targets: &[String],
+    config: &Configuration,
+    version: &str,
+    mut writer: W,
+    tx_stats: UnboundedSender<StatCommand>,
+) where
     W: Write,
 {
     let artwork = format!(
@@ -150,7 +164,7 @@ by Ben "epi" Risher {}                 ver: {}"#,
         Emoji("🤓", &format!("{:<2}", "\u{0020}")),
         version
     );
-    let status = needs_update(&CONFIGURATION.client, UPDATE_URL, version).await;
+    let status = needs_update(&CONFIGURATION.client, UPDATE_URL, version, tx_stats).await;
 
     let top = "───────────────────────────┬──────────────────────";
     let addl_section = "──────────────────────────────────────────────────";
@@ -213,12 +227,12 @@ by Ben "epi" Risher {}                 ver: {}"#,
             &mut writer,
             "{}",
             format_banner_entry!(
-                format_emoji("🗑"),
+                format_emoji("💢"),
                 "Status Code Filters",
                 format!("[{}]", code_filters.join(", "))
             )
         )
-        .unwrap_or_default(); // 🗑
+        .unwrap_or_default(); // 💢
     }
 
     writeln!(
@@ -300,6 +314,17 @@ by Ben "epi" Risher {}                 ver: {}"#,
                 &mut writer,
                 "{}",
                 format_banner_entry!(format_emoji("💢"), "Size Filter", filter)
+            )
+            .unwrap_or_default(); // 💢
+        }
+    }
+
+    if !config.filter_similar.is_empty() {
+        for filter in &config.filter_similar {
+            writeln!(
+                &mut writer,
+                "{}",
+                format_banner_entry!(format_emoji("💢"), "Similarity Filter", filter)
             )
             .unwrap_or_default(); // 💢
         }
@@ -511,11 +536,10 @@ by Ben "epi" Risher {}                 ver: {}"#,
     // ⏯
     writeln!(
         &mut writer,
-        " {}   Press [{}] to {}|{} your scan",
-        format_emoji("⏯"),
+        " {}  Press [{}] to use the {}™",
+        format_emoji("🏁"),
         style("ENTER").yellow(),
-        style("pause").red(),
-        style("resume").green()
+        style("Scan Cancel Menu").bright().yellow(),
     )
     .unwrap_or_default();
 
@@ -525,73 +549,98 @@ by Ben "epi" Risher {}                 ver: {}"#,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::VERSION;
+    use crate::{FeroxChannel, VERSION};
     use httpmock::Method::GET;
     use httpmock::MockServer;
     use std::fs::read_to_string;
     use std::io::stderr;
     use std::time::Duration;
     use tempfile::NamedTempFile;
+    use tokio::sync::mpsc;
 
-    #[tokio::test(core_threads = 1)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     /// test to hit no execution of targets for loop in banner
     async fn banner_intialize_without_targets() {
         let config = Configuration::default();
-        initialize(&[], &config, VERSION, stderr()).await;
+        let (tx, _): FeroxChannel<StatCommand> = mpsc::unbounded_channel();
+
+        initialize(&[], &config, VERSION, stderr(), tx).await;
     }
 
-    #[tokio::test(core_threads = 1)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     /// test to hit no execution of statuscode for loop in banner
     async fn banner_intialize_without_status_codes() {
-        let mut config = Configuration::default();
-        config.status_codes = vec![];
+        let config = Configuration {
+            status_codes: vec![],
+            ..Default::default()
+        };
+
+        let (tx, _): FeroxChannel<StatCommand> = mpsc::unbounded_channel();
+
         initialize(
             &[String::from("http://localhost")],
             &config,
             VERSION,
             stderr(),
+            tx,
         )
         .await;
     }
 
-    #[tokio::test(core_threads = 1)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     /// test to hit an empty config file
     async fn banner_intialize_without_config_file() {
-        let mut config = Configuration::default();
-        config.config = String::new();
+        let config = Configuration {
+            config: String::new(),
+            ..Default::default()
+        };
+
+        let (tx, _): FeroxChannel<StatCommand> = mpsc::unbounded_channel();
+
         initialize(
             &[String::from("http://localhost")],
             &config,
             VERSION,
             stderr(),
+            tx,
         )
         .await;
     }
 
-    #[tokio::test(core_threads = 1)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     /// test to hit an empty config file
     async fn banner_intialize_without_queries() {
-        let mut config = Configuration::default();
-        config.queries = vec![(String::new(), String::new())];
+        let config = Configuration {
+            queries: vec![(String::new(), String::new())],
+            ..Default::default()
+        };
+
+        let (tx, _): FeroxChannel<StatCommand> = mpsc::unbounded_channel();
+
         initialize(
             &[String::from("http://localhost")],
             &config,
             VERSION,
             stderr(),
+            tx,
         )
         .await;
     }
 
-    #[tokio::test(core_threads = 1)]
+    #[ignore]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     /// test to show that a new version is available for download
     async fn banner_intialize_with_mismatched_version() {
         let config = Configuration::default();
         let file = NamedTempFile::new().unwrap();
+        let (tx, _): FeroxChannel<StatCommand> = mpsc::unbounded_channel();
+
         initialize(
             &[String::from("http://localhost")],
             &config,
             "mismatched-version",
             &file,
+            tx,
         )
         .await;
         let contents = read_to_string(file.path()).unwrap();
@@ -600,14 +649,16 @@ mod tests {
         assert!(contents.contains("https://github.com/epi052/feroxbuster/releases/latest"));
     }
 
-    #[tokio::test(core_threads = 1)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     /// test that
     async fn banner_needs_update_returns_unknown_with_bad_url() {
-        let result = needs_update(&CONFIGURATION.client, &"", VERSION).await;
+        let (tx, _): FeroxChannel<StatCommand> = mpsc::unbounded_channel();
+
+        let result = needs_update(&CONFIGURATION.client, &"", VERSION, tx).await;
         assert!(matches!(result, UpdateStatus::Unknown));
     }
 
-    #[tokio::test(core_threads = 1)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     /// test return value of good url to needs_update
     async fn banner_needs_update_returns_up_to_date() {
         let srv = MockServer::start();
@@ -617,13 +668,15 @@ mod tests {
             then.status(200).body("{\"tag_name\":\"v1.1.0\"}");
         });
 
-        let result = needs_update(&CONFIGURATION.client, &srv.url("/latest"), "1.1.0").await;
+        let (tx, _): FeroxChannel<StatCommand> = mpsc::unbounded_channel();
+
+        let result = needs_update(&CONFIGURATION.client, &srv.url("/latest"), "1.1.0", tx).await;
 
         assert_eq!(mock.hits(), 1);
         assert!(matches!(result, UpdateStatus::UpToDate));
     }
 
-    #[tokio::test(core_threads = 1)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     /// test return value of good url to needs_update that returns a newer version than current
     async fn banner_needs_update_returns_out_of_date() {
         let srv = MockServer::start();
@@ -633,13 +686,15 @@ mod tests {
             then.status(200).body("{\"tag_name\":\"v1.1.0\"}");
         });
 
-        let result = needs_update(&CONFIGURATION.client, &srv.url("/latest"), "1.0.1").await;
+        let (tx, _): FeroxChannel<StatCommand> = mpsc::unbounded_channel();
+
+        let result = needs_update(&CONFIGURATION.client, &srv.url("/latest"), "1.0.1", tx).await;
 
         assert_eq!(mock.hits(), 1);
         assert!(matches!(result, UpdateStatus::OutOfDate));
     }
 
-    #[tokio::test(core_threads = 1)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     /// test return value of good url that times out
     async fn banner_needs_update_returns_unknown_on_timeout() {
         let srv = MockServer::start();
@@ -651,13 +706,15 @@ mod tests {
                 .delay(Duration::from_secs(8));
         });
 
-        let result = needs_update(&CONFIGURATION.client, &srv.url("/latest"), "1.0.1").await;
+        let (tx, _): FeroxChannel<StatCommand> = mpsc::unbounded_channel();
+
+        let result = needs_update(&CONFIGURATION.client, &srv.url("/latest"), "1.0.1", tx).await;
 
         assert_eq!(mock.hits(), 1);
         assert!(matches!(result, UpdateStatus::Unknown));
     }
 
-    #[tokio::test(core_threads = 1)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     /// test return value of good url with bad json response
     async fn banner_needs_update_returns_unknown_on_bad_json_response() {
         let srv = MockServer::start();
@@ -667,13 +724,15 @@ mod tests {
             then.status(200).body("not json");
         });
 
-        let result = needs_update(&CONFIGURATION.client, &srv.url("/latest"), "1.0.1").await;
+        let (tx, _): FeroxChannel<StatCommand> = mpsc::unbounded_channel();
+
+        let result = needs_update(&CONFIGURATION.client, &srv.url("/latest"), "1.0.1", tx).await;
 
         assert_eq!(mock.hits(), 1);
         assert!(matches!(result, UpdateStatus::Unknown));
     }
 
-    #[tokio::test(core_threads = 1)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     /// test return value of good url with json response that lacks the tag_name field
     async fn banner_needs_update_returns_unknown_on_json_without_correct_tag() {
         let srv = MockServer::start();
@@ -684,7 +743,9 @@ mod tests {
                 .body("{\"no tag_name\": \"doesn't exist\"}");
         });
 
-        let result = needs_update(&CONFIGURATION.client, &srv.url("/latest"), "1.0.1").await;
+        let (tx, _): FeroxChannel<StatCommand> = mpsc::unbounded_channel();
+
+        let result = needs_update(&CONFIGURATION.client, &srv.url("/latest"), "1.0.1", tx).await;
 
         assert_eq!(mock.hits(), 1);
         assert!(matches!(result, UpdateStatus::Unknown));

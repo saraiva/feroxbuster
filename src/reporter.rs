@@ -1,15 +1,23 @@
 use crate::{
     config::{CONFIGURATION, PROGRESS_PRINTER},
     scanner::RESPONSES,
+    statistics::{
+        StatCommand::{self, UpdateUsizeField},
+        StatField::ResourcesDiscovered,
+    },
     utils::{ferox_print, make_request, open_file},
     FeroxChannel, FeroxResponse, FeroxSerialize,
 };
 use console::strip_ansi_codes;
-use std::io::Write;
-use std::sync::{Arc, Once, RwLock};
-use std::{fs, io};
-use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
-use tokio::task::JoinHandle;
+use std::{
+    fs, io,
+    io::Write,
+    sync::{Arc, Once, RwLock},
+};
+use tokio::{
+    sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
+    task::JoinHandle,
+};
 
 /// Singleton buffered file behind an Arc/RwLock; used for file writes from two locations:
 ///     - [logger::initialize](../logger/fn.initialize.html) (specifically a closure on the global logger instance)
@@ -42,27 +50,35 @@ pub fn get_cached_file_handle(filename: &str) -> Option<Arc<RwLock<io::BufWriter
 pub fn initialize(
     output_file: &str,
     save_output: bool,
+    tx_stats: UnboundedSender<StatCommand>,
 ) -> (
     UnboundedSender<FeroxResponse>,
     UnboundedSender<FeroxResponse>,
     JoinHandle<()>,
     Option<JoinHandle<()>>,
 ) {
-    log::trace!("enter: initialize({}, {})", output_file, save_output);
+    log::trace!(
+        "enter: initialize({}, {}, {:?})",
+        output_file,
+        save_output,
+        tx_stats
+    );
 
     let (tx_rpt, rx_rpt): FeroxChannel<FeroxResponse> = mpsc::unbounded_channel();
     let (tx_file, rx_file): FeroxChannel<FeroxResponse> = mpsc::unbounded_channel();
 
     let file_clone = tx_file.clone();
+    let stats_clone = tx_stats.clone();
 
-    let term_reporter =
-        tokio::spawn(async move { spawn_terminal_reporter(rx_rpt, file_clone, save_output).await });
+    let term_reporter = tokio::spawn(async move {
+        spawn_terminal_reporter(rx_rpt, file_clone, stats_clone, save_output).await
+    });
 
     let file_reporter = if save_output {
         // -o used, need to spawn the thread for writing to disk
         let file_clone = output_file.to_string();
         Some(tokio::spawn(async move {
-            spawn_file_reporter(rx_file, &file_clone).await
+            spawn_file_reporter(rx_file, tx_stats, &file_clone).await
         }))
     } else {
         None
@@ -85,12 +101,14 @@ pub fn initialize(
 async fn spawn_terminal_reporter(
     mut resp_chan: UnboundedReceiver<FeroxResponse>,
     file_chan: UnboundedSender<FeroxResponse>,
+    tx_stats: UnboundedSender<StatCommand>,
     save_output: bool,
 ) {
     log::trace!(
-        "enter: spawn_terminal_reporter({:?}, {:?}, {})",
+        "enter: spawn_terminal_reporter({:?}, {:?}, {:?}, {})",
         resp_chan,
         file_chan,
+        tx_stats,
         save_output
     );
 
@@ -104,6 +122,8 @@ async fn spawn_terminal_reporter(
         if should_process_response {
             // print to stdout
             ferox_print(&resp.as_str(), &PROGRESS_PRINTER);
+
+            update_stat!(tx_stats, UpdateUsizeField(ResourcesDiscovered, 1));
 
             if save_output {
                 // -o used, need to send the report to be written out to disk
@@ -122,7 +142,13 @@ async fn spawn_terminal_reporter(
         if CONFIGURATION.replay_client.is_some() && should_process_response {
             // replay proxy specified/client created and this response's status code is one that
             // should be replayed
-            match make_request(CONFIGURATION.replay_client.as_ref().unwrap(), &resp.url()).await {
+            match make_request(
+                CONFIGURATION.replay_client.as_ref().unwrap(),
+                &resp.url(),
+                tx_stats.clone(),
+            )
+            .await
+            {
                 Ok(_) => {}
                 Err(e) => {
                     log::error!("{}", e);
@@ -151,6 +177,7 @@ async fn spawn_terminal_reporter(
 /// the given reporting criteria
 async fn spawn_file_reporter(
     mut report_channel: UnboundedReceiver<FeroxResponse>,
+    tx_stats: UnboundedSender<StatCommand>,
     output_file: &str,
 ) {
     let buffered_file = match get_cached_file_handle(&CONFIGURATION.output) {
@@ -172,6 +199,8 @@ async fn spawn_file_reporter(
     while let Some(response) = report_channel.recv().await {
         safe_file_write(&response, buffered_file.clone(), CONFIGURATION.json);
     }
+
+    update_stat!(tx_stats, StatCommand::Save);
 
     log::trace!("exit: spawn_file_reporter");
 }

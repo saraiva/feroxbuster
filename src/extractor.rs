@@ -2,6 +2,10 @@ use crate::{
     client,
     config::{Configuration, CONFIGURATION},
     scanner::SCANNED_URLS,
+    statistics::{
+        StatCommand::{self, UpdateUsizeField},
+        StatField::{LinksExtracted, TotalExpected},
+    },
     utils::{format_url, make_request},
     FeroxResponse,
 };
@@ -9,6 +13,7 @@ use lazy_static::lazy_static;
 use regex::Regex;
 use reqwest::Url;
 use std::collections::HashSet;
+use tokio::sync::mpsc::UnboundedSender;
 
 /// Regular expression used in [LinkFinder](https://github.com/GerbenJavado/LinkFinder)
 ///
@@ -47,18 +52,25 @@ fn get_sub_paths_from_path(path: &str) -> Vec<String> {
 
     let length = parts.len();
 
-    for _ in 0..length {
+    for i in 0..length {
         // iterate over all parts of the path
         if parts.is_empty() {
             // pop left us with an empty vector, we're done
             break;
         }
 
-        let possible_path = parts.join("/");
+        let mut possible_path = parts.join("/");
 
         if possible_path.is_empty() {
             // .join can result in an empty string, which we don't need, ignore
             continue;
+        }
+
+        if i > 0 {
+            // this isn't the last index of the parts array
+            // ex: /buried/misc/stupidfile.php
+            // this block skips the file but sees all parent folders
+            possible_path = format!("{}/", possible_path);
         }
 
         paths.push(possible_path); // good sub-path found
@@ -98,8 +110,15 @@ fn add_link_to_set_of_links(link: &str, url: &Url, links: &mut HashSet<String>) 
 ///         - homepage/assets/img/
 ///         - homepage/assets/
 ///         - homepage/
-pub async fn get_links(response: &FeroxResponse) -> HashSet<String> {
-    log::trace!("enter: get_links({})", response.url().as_str());
+pub async fn get_links(
+    response: &FeroxResponse,
+    tx_stats: UnboundedSender<StatCommand>,
+) -> HashSet<String> {
+    log::trace!(
+        "enter: get_links({}, {:?})",
+        response.url().as_str(),
+        tx_stats
+    );
 
     let mut links = HashSet::<String>::new();
 
@@ -135,6 +154,14 @@ pub async fn get_links(response: &FeroxResponse) -> HashSet<String> {
             }
         }
     }
+
+    let multiplier = CONFIGURATION.extensions.len().max(1);
+
+    update_stat!(tx_stats, UpdateUsizeField(LinksExtracted, links.len()));
+    update_stat!(
+        tx_stats,
+        UpdateUsizeField(TotalExpected, links.len() * multiplier)
+    );
 
     log::trace!("exit: get_links -> {:?}", links);
 
@@ -172,8 +199,15 @@ fn add_all_sub_paths(url_path: &str, response: &FeroxResponse, mut links: &mut H
 ///   - create a new Url object based on cli options/args
 ///   - check if the new Url has already been seen/scanned -> None
 ///   - make a request to the new Url ? -> Some(response) : None
-pub async fn request_feroxresponse_from_new_link(url: &str) -> Option<FeroxResponse> {
-    log::trace!("enter: request_feroxresponse_from_new_link({})", url);
+pub async fn request_feroxresponse_from_new_link(
+    url: &str,
+    tx_stats: UnboundedSender<StatCommand>,
+) -> Option<FeroxResponse> {
+    log::trace!(
+        "enter: request_feroxresponse_from_new_link({}, {:?})",
+        url,
+        tx_stats
+    );
 
     // create a url based on the given command line options, return None on error
     let new_url = match format_url(
@@ -182,6 +216,7 @@ pub async fn request_feroxresponse_from_new_link(url: &str) -> Option<FeroxRespo
         CONFIGURATION.add_slash,
         &CONFIGURATION.queries,
         None,
+        tx_stats.clone(),
     ) {
         Ok(url) => url,
         Err(_) => {
@@ -197,7 +232,7 @@ pub async fn request_feroxresponse_from_new_link(url: &str) -> Option<FeroxRespo
     }
 
     // make the request and store the response
-    let new_response = match make_request(&CONFIGURATION.client, &new_url).await {
+    let new_response = match make_request(&CONFIGURATION.client, &new_url, tx_stats).await {
         Ok(resp) => resp,
         Err(_) => {
             log::trace!("exit: request_feroxresponse_from_new_link -> None");
@@ -221,8 +256,16 @@ pub async fn request_feroxresponse_from_new_link(url: &str) -> Option<FeroxRespo
 ///     
 /// The length of the given path has no effect on what's requested; it's always
 /// base url + /robots.txt
-pub async fn request_robots_txt(base_url: &str, config: &Configuration) -> Option<FeroxResponse> {
-    log::trace!("enter: get_robots_file({})", base_url);
+pub async fn request_robots_txt(
+    base_url: &str,
+    config: &Configuration,
+    tx_stats: UnboundedSender<StatCommand>,
+) -> Option<FeroxResponse> {
+    log::trace!(
+        "enter: get_robots_file({}, CONFIGURATION, {:?})",
+        base_url,
+        tx_stats
+    );
 
     // more often than not, domain/robots.txt will redirect to www.domain/robots.txt or something
     // similar; to account for that, create a client that will follow redirects, regardless of
@@ -248,7 +291,7 @@ pub async fn request_robots_txt(base_url: &str, config: &Configuration) -> Optio
     if let Ok(mut url) = Url::parse(base_url) {
         url.set_path("/robots.txt"); // overwrite existing path with /robots.txt
 
-        if let Ok(response) = make_request(&client, &url).await {
+        if let Ok(response) = make_request(&client, &url, tx_stats).await {
             let ferox_response = FeroxResponse::from(response, true).await;
 
             log::trace!("exit: get_robots_file -> {}", ferox_response);
@@ -267,11 +310,19 @@ pub async fn request_robots_txt(base_url: &str, config: &Configuration) -> Optio
 ///     http://localhost/stuff/things
 /// this function requests:
 ///     http://localhost/robots.txt
-pub async fn extract_robots_txt(base_url: &str, config: &Configuration) -> HashSet<String> {
-    log::trace!("enter: extract_robots_txt({}, CONFIGURATION)", base_url);
+pub async fn extract_robots_txt(
+    base_url: &str,
+    config: &Configuration,
+    tx_stats: UnboundedSender<StatCommand>,
+) -> HashSet<String> {
+    log::trace!(
+        "enter: extract_robots_txt({}, CONFIGURATION, {:?})",
+        base_url,
+        tx_stats
+    );
     let mut links = HashSet::new();
 
-    if let Some(response) = request_robots_txt(&base_url, &config).await {
+    if let Some(response) = request_robots_txt(&base_url, &config, tx_stats.clone()).await {
         for capture in ROBOTS_REGEX.captures_iter(response.text.as_str()) {
             if let Some(new_path) = capture.name("url_path") {
                 if let Ok(mut new_url) = Url::parse(base_url) {
@@ -282,6 +333,14 @@ pub async fn extract_robots_txt(base_url: &str, config: &Configuration) -> HashS
         }
     }
 
+    let multiplier = CONFIGURATION.extensions.len().max(1);
+
+    update_stat!(tx_stats, UpdateUsizeField(LinksExtracted, links.len()));
+    update_stat!(
+        tx_stats,
+        UpdateUsizeField(TotalExpected, links.len() * multiplier)
+    );
+
     log::trace!("exit: extract_robots_txt -> {:?}", links);
     links
 }
@@ -290,9 +349,11 @@ pub async fn extract_robots_txt(base_url: &str, config: &Configuration) -> HashS
 mod tests {
     use super::*;
     use crate::utils::make_request;
+    use crate::FeroxChannel;
     use httpmock::Method::GET;
     use httpmock::MockServer;
     use reqwest::Client;
+    use tokio::sync::mpsc;
 
     #[test]
     /// extract sub paths from the given url fragment; expect 4 sub paths and that all are
@@ -301,10 +362,10 @@ mod tests {
         let path = "homepage/assets/img/icons/handshake.svg";
         let paths = get_sub_paths_from_path(&path);
         let expected = vec![
-            "homepage",
-            "homepage/assets",
-            "homepage/assets/img",
-            "homepage/assets/img/icons",
+            "homepage/",
+            "homepage/assets/",
+            "homepage/assets/img/",
+            "homepage/assets/img/icons/",
             "homepage/assets/img/icons/handshake.svg",
         ];
 
@@ -321,7 +382,7 @@ mod tests {
     fn extractor_get_sub_paths_from_path_with_enclosing_slashes() {
         let path = "/homepage/assets/";
         let paths = get_sub_paths_from_path(&path);
-        let expected = vec!["homepage", "homepage/assets"];
+        let expected = vec!["homepage/", "homepage/assets"];
 
         assert_eq!(paths.len(), expected.len());
         for expected_path in expected {
@@ -385,7 +446,7 @@ mod tests {
         assert!(links.is_empty());
     }
 
-    #[tokio::test(core_threads = 1)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     /// use make_request to generate a Response, and use the Response to test get_links;
     /// the response will contain an absolute path to a domain that is not part of the scanned
     /// domain; expect an empty set returned
@@ -402,12 +463,13 @@ mod tests {
 
         let client = Client::new();
         let url = Url::parse(&srv.url("/some-path")).unwrap();
+        let (tx, _): FeroxChannel<StatCommand> = mpsc::unbounded_channel();
 
-        let response = make_request(&client, &url).await.unwrap();
+        let response = make_request(&client, &url, tx.clone()).await.unwrap();
 
         let ferox_response = FeroxResponse::from(response, true).await;
 
-        let links = get_links(&ferox_response).await;
+        let links = get_links(&ferox_response, tx).await;
 
         assert!(links.is_empty());
 
@@ -415,7 +477,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test(core_threads = 1)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     /// test that /robots.txt is correctly requested given a base url (happy path)
     async fn request_robots_txt_with_and_without_proxy() {
         let srv = MockServer::start();
@@ -427,13 +489,15 @@ mod tests {
 
         let mut config = Configuration::default();
 
-        request_robots_txt(&srv.url("/api/users/stuff/things"), &config).await;
+        let (tx, _): FeroxChannel<StatCommand> = mpsc::unbounded_channel();
+
+        request_robots_txt(&srv.url("/api/users/stuff/things"), &config, tx.clone()).await;
 
         // note: the proxy doesn't actually do anything other than hit a different code branch
         // in this unit test; it would however have an effect on an integration test
         config.proxy = srv.url("/ima-proxy");
 
-        request_robots_txt(&srv.url("/api/different/path"), &config).await;
+        request_robots_txt(&srv.url("/api/different/path"), &config, tx).await;
 
         assert_eq!(mock.hits(), 2);
     }
